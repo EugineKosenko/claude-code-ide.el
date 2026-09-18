@@ -211,6 +211,20 @@ display diffs in the terminal instead."
   :type 'boolean
   :group 'claude-code-ide)
 
+(defvar claude-code-ide-auto-accept-edits nil
+  "When non-nil, automatically accept all file edits without ediff.
+Toggle with `claude-code-ide-toggle-auto-accept'.")
+
+(defun claude-code-ide-toggle-auto-accept ()
+  "Toggle automatic acceptance of Claude Code file edits.
+When enabled, edits are accepted immediately without opening ediff.
+When disabled, ediff is shown for each edit as usual."
+  (interactive)
+  (setq claude-code-ide-auto-accept-edits
+        (not claude-code-ide-auto-accept-edits))
+  (message "Claude Code auto-accept edits: %s"
+           (if claude-code-ide-auto-accept-edits "ON" "OFF")))
+
 (defcustom claude-code-ide-switch-tab-on-ediff t
   "Whether to switch back to Claude's original tab when opening ediff.
 When non-nil (default), Claude Code will switch back to the tab
