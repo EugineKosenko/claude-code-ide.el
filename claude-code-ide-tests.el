@@ -2420,6 +2420,30 @@ sibling instance."
       (claude-code-ide-mcp-http-server--handle-get mock-request)
       (should (equal claude-code-ide-mcp-server-tests--last-response-status 404)))))
 
+(ert-deftest claude-code-ide-mcp-server-test-dispatch-unknown-method ()
+  "Unknown methods signal a JSON-RPC error that is a regular `error'."
+  (require 'claude-code-ide-mcp-http-server)
+  (let ((err (should-error
+              (claude-code-ide-mcp-http-server--dispatch "ping" nil)
+              :type 'json-rpc-error)))
+    (should (equal (cadr err) -32601))
+    (should (string-match-p "ping" (nth 2 err)))
+    (should (memq 'error (get 'json-rpc-error 'error-conditions)))))
+
+(ert-deftest claude-code-ide-mcp-server-test-handle-post-unknown-method ()
+  "An unknown method gets a -32601 response carrying the request id."
+  (require 'claude-code-ide-mcp-http-server)
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'ws-headers) (lambda (_r) '((:POST . "/mcp/s1"))))
+              ((symbol-function 'ws-body)
+               (lambda (_r) "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}"))
+              ((symbol-function 'claude-code-ide-mcp-http-server--send-json-response)
+               (lambda (_r status body) (setq sent (cons status body)))))
+      (claude-code-ide-mcp-http-server--handle-post 'request)
+      (should (equal (car sent) 200))
+      (should (equal (alist-get 'id (cdr sent)) 7))
+      (should (equal (alist-get 'code (alist-get 'error (cdr sent))) -32601)))))
+
 ;;; MCP Server Session Context Tests
 
 (ert-deftest claude-code-ide-mcp-server-test-session-registration ()
@@ -3030,6 +3054,167 @@ sibling instance."
               (should-not (claude-code-ide-mcp-session-last-selection session-a))
               (should-not (claude-code-ide-mcp-session-last-selection session-b))
 
+              (set-buffer-modified-p nil)
+              (setq buffer-file-name nil))))
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-clear-selection-dismisses-file ()
+  "Clearing makes the instance forget its file and keeps that file dismissed."
+  (claude-code-ide-tests--clear-processes)
+  (let* ((project-dir "/tmp/claude-clear-selection/")
+         (file (expand-file-name "file.txt" project-dir))
+         (other (expand-file-name "other.txt" project-dir))
+         (client (claude-code-ide-tests--make-websocket "ws://127.0.0.1:10012"))
+         (sent '()))
+    (unwind-protect
+        (let ((session (claude-code-ide-tests--make-session project-dir
+                                                            :client client)))
+          (cl-letf (((symbol-function 'websocket-send-text)
+                     (lambda (_ws text)
+                       (push (json-parse-string text :object-type 'alist) sent))))
+            (with-temp-buffer
+              (insert "line 1\nline 2\n")
+              (setq buffer-file-name file)
+              (goto-char (point-min))
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should (equal file (alist-get 'filePath
+                                             (alist-get 'params (car sent)))))
+
+              ;; Clearing sends a selection that names no file and no text
+              (setq sent '())
+              (claude-code-ide-mcp-clear-selection session)
+              (should (= 1 (length sent)))
+              (let ((params (alist-get 'params (car sent))))
+                (should (equal "selection_changed" (alist-get 'method (car sent))))
+                (should-not (assq 'filePath params))
+                (should-not (assq 'text params))
+                (should (alist-get 'start (alist-get 'selection params)))
+                (should (alist-get 'end (alist-get 'selection params))))
+              (should-not (claude-code-ide-mcp-session-last-selection session))
+              (should (equal file (claude-code-ide-mcp-session-dismissed-file session)))
+
+              ;; Cursor movement inside the dismissed file stays silent
+              (setq sent '())
+              (forward-line 1)
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should-not sent)
+
+              ;; Selecting a region ends the dismissal
+              (set-mark (point-min))
+              (goto-char (point-max))
+              (let ((transient-mark-mode t))
+                (activate-mark)
+                (claude-code-ide-mcp--send-selection-for-project project-dir)
+                (deactivate-mark))
+              (should (= 1 (length sent)))
+              (should (equal "line 1\nline 2\n"
+                             (alist-get 'text (alist-get 'params (car sent)))))
+              (should-not (claude-code-ide-mcp-session-dismissed-file session))
+
+              ;; Visiting another file ends it as well
+              (claude-code-ide-mcp-clear-selection session)
+              (should (equal file (claude-code-ide-mcp-session-dismissed-file session)))
+              (setq sent '())
+              (setq buffer-file-name other)
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should (= 1 (length sent)))
+              (should (equal other (alist-get 'filePath
+                                              (alist-get 'params (car sent)))))
+              (should-not (claude-code-ide-mcp-session-dismissed-file session))
+
+              ;; A file outside the project ends it too
+              (claude-code-ide-mcp-clear-selection session)
+              (setq buffer-file-name "/tmp/elsewhere/file.txt")
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should-not (claude-code-ide-mcp-session-dismissed-file session))
+
+              (set-buffer-modified-p nil)
+              (setq buffer-file-name nil))))
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-terminal-keybindings-bind-clear-selection ()
+  "Every terminal backend binds C-c C-x to clearing the editor context."
+  (dolist (backend '(vterm eat ghostel))
+    (with-temp-buffer
+      (use-local-map (make-sparse-keymap))
+      (let ((claude-code-ide-terminal-backend backend))
+        (claude-code-ide--setup-terminal-keybindings))
+      (should (eq #'claude-code-ide-clear-selection
+                  (lookup-key (current-local-map) (kbd "C-c C-x"))))
+      (should (eq #'claude-code-ide-send-escape
+                  (lookup-key (current-local-map) (kbd "C-<escape>")))))))
+
+(ert-deftest claude-code-ide-test-clear-selection-command ()
+  "The command clears the resolved instance and refuses a disconnected one."
+  (claude-code-ide-tests--clear-processes)
+  (let ((project-dir "/tmp/claude-clear-command/")
+        (cleared '()))
+    (unwind-protect
+        (let ((connected (claude-code-ide-tests--make-session
+                          project-dir
+                          :client (claude-code-ide-tests--make-websocket
+                                   "ws://127.0.0.1:10013")))
+              (idle (claude-code-ide-tests--make-session project-dir
+                                                         :instance-name "b")))
+          (cl-letf (((symbol-function 'claude-code-ide-mcp-clear-selection)
+                     (lambda (session) (push session cleared))))
+            (cl-letf (((symbol-function 'claude-code-ide--resolve-session)
+                       (lambda (&rest _) connected)))
+              (claude-code-ide-clear-selection)
+              (should (equal cleared (list connected))))
+            (cl-letf (((symbol-function 'claude-code-ide--resolve-session)
+                       (lambda (&rest _) idle)))
+              (should-error (claude-code-ide-clear-selection) :type 'user-error))
+            (should (equal cleared (list connected)))))
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-share-opened-file-off-reports-regions-only ()
+  "With `claude-code-ide-share-opened-file' nil only regions reach Claude."
+  (claude-code-ide-tests--clear-processes)
+  (let* ((project-dir "/tmp/claude-regions-only/")
+         (file (expand-file-name "file.txt" project-dir))
+         (client (claude-code-ide-tests--make-websocket "ws://127.0.0.1:10016"))
+         (claude-code-ide-share-opened-file nil)
+         (sent '()))
+    (unwind-protect
+        (let ((session (claude-code-ide-tests--make-session project-dir
+                                                            :client client)))
+          (cl-letf (((symbol-function 'websocket-send-text)
+                     (lambda (_ws text)
+                       (push (json-parse-string text :object-type 'alist) sent))))
+            (with-temp-buffer
+              (insert "line 1\nline 2\n")
+              (setq buffer-file-name file)
+              (goto-char (point-min))
+              ;; A bare cursor position is not reported
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should-not sent)
+              (should-not (claude-code-ide-mcp-session-last-selection session))
+
+              ;; A region is
+              (set-mark (point-min))
+              (goto-char (point-max))
+              (let ((transient-mark-mode t))
+                (activate-mark)
+                (claude-code-ide-mcp--send-selection-for-project project-dir)
+                (deactivate-mark))
+              (should (= 1 (length sent)))
+              (let ((params (alist-get 'params (car sent))))
+                (should (equal file (alist-get 'filePath params)))
+                (should (equal "line 1\nline 2\n" (alist-get 'text params))))
+
+              ;; Deactivating it makes the instance forget the region
+              (setq sent '())
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should (= 1 (length sent)))
+              (should-not (assq 'filePath (alist-get 'params (car sent))))
+              (should-not (claude-code-ide-mcp-session-last-selection session))
+
+              ;; Cursor movement stays silent afterwards
+              (setq sent '())
+              (forward-line -1)
+              (claude-code-ide-mcp--send-selection-for-project project-dir)
+              (should-not sent)
               (set-buffer-modified-p nil)
               (setq buffer-file-name nil))))
       (claude-code-ide-tests--clear-processes))))
