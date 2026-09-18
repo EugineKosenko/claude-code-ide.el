@@ -593,6 +593,62 @@ have completed before cleanup.  Waits up to 5 seconds."
           (claude-code-ide--terminal-send-return)
           (should (equal ghostel-string-sent "\r")))))))
 
+(ert-deftest claude-code-ide-test-terminal-send-backward-char ()
+  "Test that `claude-code-ide--terminal-send-backward-char' sends C-b."
+  (let ((eat-string-sent nil))
+    (cl-letf (((symbol-function 'eat-term-send-string)
+               (lambda (_term str) (setq eat-string-sent str))))
+      (with-temp-buffer
+        (let ((claude-code-ide-terminal-backend 'eat))
+          (setq-local eat-terminal t)
+          (claude-code-ide--terminal-send-backward-char)
+          (should (equal eat-string-sent (kbd "C-b"))))))))
+
+(defvar eat-semi-char-mode-map)
+
+(ert-deftest claude-code-ide-test-setup-terminal-keybindings-left-arrow ()
+  "Test that <left> is bound to the C-b workaround only when enabled."
+  ;; eat backend: overridden via `minor-mode-overriding-map-alist',
+  ;; since `eat' itself binds <left> in a higher-precedence minor-mode
+  ;; keymap (`eat-semi-char-mode-map') that `local-set-key' cannot reach.
+  (with-temp-buffer
+    (let* ((claude-code-ide-terminal-backend 'eat)
+           (claude-code-ide-fix-left-arrow-agents-screen t)
+           (eat-semi-char-mode-map (make-sparse-keymap)))
+      (define-key eat-semi-char-mode-map "a" #'ignore)
+      (claude-code-ide--setup-terminal-keybindings)
+      (let ((map (cdr (assq 'eat--semi-char-mode
+                            minor-mode-overriding-map-alist))))
+        (should (eq (lookup-key map (kbd "<left>"))
+                    #'claude-code-ide--terminal-send-backward-char))
+        ;; The override replaces the mode's keymap, so other keys must
+        ;; still resolve through the parent.
+        (should (eq (lookup-key map "a") #'ignore)))))
+  (with-temp-buffer
+    (let ((claude-code-ide-terminal-backend 'eat)
+          (claude-code-ide-fix-left-arrow-agents-screen nil))
+      (claude-code-ide--setup-terminal-keybindings)
+      (should-not (assq 'eat--semi-char-mode
+                        minor-mode-overriding-map-alist))))
+  ;; ghostel/vterm backends: plain buffer-local `local-set-key'.
+  (with-temp-buffer
+    (let ((claude-code-ide-terminal-backend 'ghostel)
+          (claude-code-ide-fix-left-arrow-agents-screen t))
+      (claude-code-ide--setup-terminal-keybindings)
+      (should (eq (lookup-key (current-local-map) (kbd "<left>"))
+                  #'claude-code-ide--terminal-send-backward-char))))
+  (with-temp-buffer
+    (let ((claude-code-ide-terminal-backend 'ghostel)
+          (claude-code-ide-fix-left-arrow-agents-screen nil))
+      (claude-code-ide--setup-terminal-keybindings)
+      (should-not (lookup-key (current-local-map) (kbd "<left>"))))))
+
+(ert-deftest claude-code-ide-test-setup-terminal-keybindings-unknown-backend ()
+  "Test that `claude-code-ide--setup-terminal-keybindings' rejects an unknown backend."
+  (with-temp-buffer
+    (let ((claude-code-ide-terminal-backend 'unknown-backend))
+      (should-error (claude-code-ide--setup-terminal-keybindings)))))
+
 (ert-deftest claude-code-ide-test-send-prompt-command ()
   "Test the claude-code-ide-send-prompt command."
   (claude-code-ide-tests--clear-processes)

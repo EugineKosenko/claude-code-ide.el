@@ -68,6 +68,7 @@
 
 ;; External variable declarations
 (defvar eat-terminal)
+(defvar eat-semi-char-mode-map)
 (defvar eat--synchronize-scroll-function)
 (defvar vterm-shell)
 (defvar vterm-environment)
@@ -295,6 +296,19 @@ alternative rendering mode that eliminates terminal flicker."
 When non-nil (default), prevents the terminal from reflowing on height-only
 changes which can trigger uncontrollable scrolling in Claude Code.
 See: https://github.com/anthropics/claude-code/issues/1422
+This setting should be removed once the upstream bug is fixed."
+  :type 'boolean
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-fix-left-arrow-agents-screen t
+  "Workaround for Claude Code agents-screen bug #94483.
+When non-nil (default), the <left> key in a Claude Code terminal buffer
+sends `C-b' instead of the terminal's native left-arrow escape sequence.
+At an empty prompt, Claude Code interprets the raw left-arrow sequence as
+a request to open the agents screen; returning to the chat afterwards
+then breaks ediff for that session.  `C-b' moves the cursor back like
+the left arrow does, without triggering this bug.
+See: https://github.com/anthropics/claude-code/issues/94483
 This setting should be removed once the upstream bug is fixed."
   :type 'boolean
   :group 'claude-code-ide)
@@ -595,6 +609,28 @@ unless `evil-ghostel-mode' is active in this buffer."
    (t
     (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
 
+(defun claude-code-ide--terminal-send-backward-char ()
+  "Send `C-b' to the terminal in the current buffer.
+Bound to <left> as a workaround; see
+`claude-code-ide-fix-left-arrow-agents-screen'."
+  (interactive)
+  (claude-code-ide--terminal-send-string (kbd "C-b")))
+
+(defun claude-code-ide--make-eat-left-arrow-keymap ()
+  "Return a keymap overriding <left> for `eat--semi-char-mode'.
+`eat' binds <left> to `eat-self-input' in `eat-semi-char-mode-map', a
+minor-mode keymap that takes precedence over a buffer's local
+\(major-mode\) map, so `local-set-key' alone cannot override it there.
+An entry in `minor-mode-overriding-map-alist' replaces the mode's
+keymap entirely, so the returned keymap inherits from
+`eat-semi-char-mode-map' to keep every other key working.
+See `claude-code-ide-fix-left-arrow-agents-screen'."
+  (let ((map (make-sparse-keymap)))
+    (when (keymapp (bound-and-true-p eat-semi-char-mode-map))
+      (set-keymap-parent map eat-semi-char-mode-map))
+    (define-key map (kbd "<left>") #'claude-code-ide--terminal-send-backward-char)
+    map))
+
 (defun claude-code-ide--sync-terminal-dimensions (buffer window)
   "Sync terminal dimensions in BUFFER to match WINDOW size.
 This ensures the terminal process has the correct dimensions after
@@ -617,25 +653,24 @@ from the window where it was initially created."
 This function binds:
 - M-RET (Alt-Return) to insert a newline
 - C-<escape> to send escape
-- C-c C-x to drop the file or selection shown in the prompt"
-  (cond
-   ((eq claude-code-ide-terminal-backend 'vterm)
-    ;; For vterm, we set up local keybindings in vterm-mode-map
-    (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
-    (local-set-key (kbd "C-c C-x") #'claude-code-ide-clear-selection))
-   ((eq claude-code-ide-terminal-backend 'eat)
-    ;; For eat, we need to modify the semi-char mode map which is the default
-    ;; We use local-set-key to make it buffer-local
-    (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
-    (local-set-key (kbd "C-c C-x") #'claude-code-ide-clear-selection))
-   ((eq claude-code-ide-terminal-backend 'ghostel)
-    (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
-    (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
-    (local-set-key (kbd "C-c C-x") #'claude-code-ide-clear-selection))
-   (t
-    (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))))
+- C-c C-x to drop the file or selection shown in the prompt
+- <left> to send `C-b' (see `claude-code-ide-fix-left-arrow-agents-screen')
+The first three are buffer-local via `local-set-key', applying the same
+way regardless of `claude-code-ide-terminal-backend'.  <left> needs a
+different mechanism under the `eat' backend; see
+`claude-code-ide--make-eat-left-arrow-keymap'."
+  (unless (memq claude-code-ide-terminal-backend '(vterm eat ghostel))
+    (error "Unknown terminal backend: %s" claude-code-ide-terminal-backend))
+  (local-set-key (kbd "S-<return>") #'claude-code-ide-insert-newline)
+  (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape)
+  (local-set-key (kbd "C-c C-x") #'claude-code-ide-clear-selection)
+  (when claude-code-ide-fix-left-arrow-agents-screen
+    (if (eq claude-code-ide-terminal-backend 'eat)
+        (setq minor-mode-overriding-map-alist
+              (cons (cons 'eat--semi-char-mode
+                          (claude-code-ide--make-eat-left-arrow-keymap))
+                    minor-mode-overriding-map-alist))
+      (local-set-key (kbd "<left>") #'claude-code-ide--terminal-send-backward-char))))
 
 ;;; Terminal Reflow Glitch Prevention
 ;;
