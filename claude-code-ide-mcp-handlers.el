@@ -53,7 +53,6 @@
 (defvar claude-code-ide-focus-claude-after-ediff)
 (defvar claude-code-ide-switch-tab-on-ediff)
 (defvar claude-code-ide-use-ide-diff)
-(defvar claude-code-ide-auto-accept-edits)
 
 ;;; Tool Registry - Define variables first to ensure they're available
 
@@ -375,7 +374,7 @@ ARGUMENTS should contain:
     ;; Auto-accept: skip ediff entirely and return FILE_SAVED
     ;; via a deferred timer so the dispatcher registers the
     ;; deferred handler before the response arrives.
-    (when claude-code-ide-auto-accept-edits
+    (when (claude-code-ide-mcp-session-auto-accept session)
       (let ((sess session)
             (contents new-file-contents)
             (tname tab-name))
