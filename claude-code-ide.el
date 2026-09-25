@@ -895,6 +895,25 @@ EXCLUDE-SESSION's own name is treated as free (used while renaming)."
       (cl-incf n))
     (if (= n 1) nil (number-to-string n))))
 
+(defun claude-code-ide--instance-name-problem (name project-dir &optional exclude-session)
+  "Return why NAME cannot be an instance name in PROJECT-DIR, or nil.
+The result is a human-readable string describing the problem (a
+purely numeric NAME, a forbidden character, or a collision with
+another instance's name), or nil when NAME is fine as given \(it is
+NOT trimmed or checked for emptiness — callers decide what an empty
+NAME means).  EXCLUDE-SESSION's own name is treated as free \(used
+while renaming\)."
+  (cond
+   ((string-match-p "\\`[0-9]+\\'" name)
+    "Numeric names are reserved for auto-numbering")
+   ((string-match-p "[][*[:cntrl:]]" name)
+    "Name cannot contain [, ], or *")
+   ((cl-some (lambda (session)
+               (and (not (eq session exclude-session))
+                    (equal name (claude-code-ide-mcp-session-instance-name session))))
+             (claude-code-ide-mcp--sessions-for-project project-dir))
+    (format "Name already used in this project: %s" name))))
+
 (defun claude-code-ide--read-instance-name (project-dir &optional prompt exclude-session)
   "Read and validate an instance name for PROJECT-DIR.
 Empty input auto-numbers (nil = the plain unnamed slot).  PROMPT
@@ -904,23 +923,14 @@ checks (used while renaming).  Returns the name string or nil."
     (while (not done)
       (setq name (string-trim
                   (read-string (or prompt "Instance name (empty for auto): "))))
-      (cond
-       ((string-empty-p name)
-        (setq name (claude-code-ide--auto-instance-name project-dir exclude-session)
-              done t))
-       ((string-match-p "\\`[0-9]+\\'" name)
-        (message "Numeric names are reserved for auto-numbering")
-        (sit-for 1))
-       ((string-match-p "[][*[:cntrl:]]" name)
-        (message "Name cannot contain [, ], or *")
-        (sit-for 1))
-       ((cl-some (lambda (session)
-                   (and (not (eq session exclude-session))
-                        (equal name (claude-code-ide-mcp-session-instance-name session))))
-                 (claude-code-ide-mcp--sessions-for-project project-dir))
-        (message "Name already used in this project: %s" name)
-        (sit-for 1))
-       (t (setq done t))))
+      (if (string-empty-p name)
+          (setq name (claude-code-ide--auto-instance-name project-dir exclude-session)
+                done t)
+        (let ((problem (claude-code-ide--instance-name-problem
+                        name project-dir exclude-session)))
+          (if problem
+              (progn (message "%s" problem) (sit-for 1))
+            (setq done t)))))
     name))
 
 (defconst claude-code-ide--window-slot-block 16
@@ -1492,14 +1502,18 @@ Signals an error if terminal fails to initialize."
              (ignore-errors (kill-buffer created-buffer))))
          (signal (car err) (cdr err)))))))
 
-(defun claude-code-ide--start-session (&optional continue resume)
+(defun claude-code-ide--start-session (&optional continue resume instance-name instance-name-given)
   "Start a new Claude Code instance for the current project.
 If CONTINUE is non-nil, start Claude with the -c (continue) flag.
 If RESUME is non-nil, start Claude with the -r (resume) flag.
 
 Always creates a new instance; a project may run any number of them
 concurrently.  When the project already has instances (or with a
-prefix argument), prompts for an optional instance name.
+prefix argument), prompts for an optional instance name — unless
+INSTANCE-NAME-GIVEN is non-nil, in which case INSTANCE-NAME (nil for
+the plain unnamed slot) is used as-is and the prompt is skipped
+entirely; the caller (`claude-code-ide-start') is then responsible for
+validating it first.
 
 This function handles:
 - CLI availability checking
@@ -1516,11 +1530,14 @@ This function handles:
   (claude-code-ide--terminal-ensure-backend)
 
   (let* ((working-dir (claude-code-ide--get-working-directory))
-         ;; Additional instances get an optional name; a prefix argument
-         ;; offers the prompt for the first instance too
-         (instance-name (when (or (claude-code-ide-mcp--sessions-for-project working-dir)
-                                  current-prefix-arg)
-                          (claude-code-ide--read-instance-name working-dir)))
+         ;; A given name skips the prompt outright; otherwise additional
+         ;; instances get an optional name, and a prefix argument offers
+         ;; the prompt for the first instance too
+         (instance-name (if instance-name-given
+                            instance-name
+                          (when (or (claude-code-ide-mcp--sessions-for-project working-dir)
+                                    current-prefix-arg)
+                            (claude-code-ide--read-instance-name working-dir))))
          ;; A live instance may already own the base name — e.g. two
          ;; projects sharing a basename both render as *claude-code[proj]*.
          ;; Uniquify instead of clobbering or refusing.
@@ -1641,7 +1658,9 @@ Always creates a new instance; a project may run several concurrently.
 When the project already has instances (or with a prefix argument),
 prompts for an optional instance name.  Use `claude-code-ide-toggle',
 `claude-code-ide-switch-to-buffer' or `claude-code-ide-list-sessions'
-to reach running instances."
+to reach running instances.  For a headless caller that must name the
+instance without a minibuffer prompt (e.g. `emacsclient --eval'), see
+`claude-code-ide-start' instead."
   (interactive)
   (claude-code-ide--start-session))
 
@@ -1661,6 +1680,36 @@ recent conversation in the current directory.  Always creates a new
 instance; a second continued instance forks the same conversation."
   (interactive)
   (claude-code-ide--start-session t))
+
+;;;###autoload
+(defun claude-code-ide-start (&optional instance-name continue resume)
+  "Start a new Claude Code instance, naming it from INSTANCE-NAME.
+Like `claude-code-ide', except the new instance's name comes directly
+from INSTANCE-NAME instead of a minibuffer prompt — for a headless
+caller (e.g. `emacsclient --eval'), where prompting via `read-string'
+would block the shared Emacs server.
+
+Nil or an empty/whitespace-only INSTANCE-NAME picks the lowest free
+auto name, exactly like empty input at the interactive prompt.  A
+non-empty INSTANCE-NAME is validated the same way manual input is
+\(rejecting a purely numeric name, `[', `]', `*', control characters,
+or a name already used in this project\), signaling a `user-error'
+instead of re-prompting when it is not usable.
+
+Bind `default-directory' to pick the project, exactly as for
+`claude-code-ide'.  CONTINUE and RESUME behave as in
+`claude-code-ide-continue' and `claude-code-ide-resume'."
+  (interactive (list (let ((name (read-string "Instance name (empty for auto): ")))
+                       (unless (string-empty-p name) name))))
+  (let* ((project-dir (claude-code-ide--get-working-directory))
+         (trimmed (and instance-name (string-trim instance-name)))
+         (name (if (or (null trimmed) (string-empty-p trimmed))
+                   (claude-code-ide--auto-instance-name project-dir)
+                 (when-let* ((problem (claude-code-ide--instance-name-problem
+                                      trimmed project-dir)))
+                   (user-error "%s" problem))
+                 trimmed)))
+    (claude-code-ide--start-session continue resume name t)))
 
 ;;;###autoload
 (defun claude-code-ide-check-status ()

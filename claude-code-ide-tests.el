@@ -1026,6 +1026,132 @@ port, window slot and terminal buffer instead of reusing the first."
       (claude-code-ide-tests--stop-all-sessions)
       (claude-code-ide-tests--clear-processes))))
 
+(ert-deftest claude-code-ide-test-start-explicit-name-no-prompt ()
+  "`claude-code-ide-start' names the instance without a minibuffer prompt.
+This is the headless entry point (e.g. `emacsclient --eval'), where a
+`read-string' prompt would block the shared Emacs server; `read-string'
+is mocked to error so any accidental prompt fails the test loudly."
+  (claude-code-ide-tests--clear-processes)
+  (let ((processes '())
+        (displayed '()))
+    (unwind-protect
+        (claude-code-ide-tests--with-temp-directory
+         (lambda ()
+           (let ((claude-code-ide--cli-available t)
+                 (claude-code-ide-cli-path "echo")
+                 (claude-code-ide-terminal-initialization-delay 0)
+                 (claude-code-ide-prevent-reflow-glitch nil)
+                 (working-dir (claude-code-ide--get-working-directory)))
+             (cl-letf (((symbol-function 'claude-code-ide--terminal-ensure-backend)
+                        #'ignore)
+                       ((symbol-function 'read-string)
+                        (lambda (&rest _)
+                          (error "read-string must not be called by claude-code-ide-start")))
+                       ((symbol-function 'claude-code-ide--create-terminal-session)
+                        (lambda (buffer-name &rest _)
+                          (let ((buffer (generate-new-buffer buffer-name))
+                                (process (start-process "mock-claude" nil
+                                                        "sleep" "30")))
+                            (push process processes)
+                            (cons buffer process))))
+                       ((symbol-function 'claude-code-ide--display-buffer-in-side-window)
+                        (lambda (buffer) (push buffer displayed) nil)))
+               ;; The first instance is unnamed
+               (claude-code-ide--start-session)
+               ;; The second is named directly, no prompt
+               (claude-code-ide-start "second")
+               (let* ((sessions (claude-code-ide-mcp--sessions-for-project working-dir))
+                      (names (mapcar #'claude-code-ide-mcp-session-instance-name sessions)))
+                 (should (= 2 (length sessions)))
+                 (should (member nil names))
+                 (should (member "second" names)))))))
+      (dolist (session (claude-code-ide-mcp--active-sessions))
+        (ignore-errors (claude-code-ide--cleanup-session session)))
+      (dolist (process processes)
+        (when (process-live-p process)
+          (delete-process process)))
+      (claude-code-ide-tests--stop-all-sessions)
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-start-nil-name-auto-numbers ()
+  "`claude-code-ide-start' with no name picks the lowest free auto name."
+  (claude-code-ide-tests--clear-processes)
+  (let ((processes '())
+        (displayed '()))
+    (unwind-protect
+        (claude-code-ide-tests--with-temp-directory
+         (lambda ()
+           (let ((claude-code-ide--cli-available t)
+                 (claude-code-ide-cli-path "echo")
+                 (claude-code-ide-terminal-initialization-delay 0)
+                 (claude-code-ide-prevent-reflow-glitch nil)
+                 (working-dir (claude-code-ide--get-working-directory)))
+             (cl-letf (((symbol-function 'claude-code-ide--terminal-ensure-backend)
+                        #'ignore)
+                       ((symbol-function 'read-string)
+                        (lambda (&rest _)
+                          (error "read-string must not be called by claude-code-ide-start")))
+                       ((symbol-function 'claude-code-ide--create-terminal-session)
+                        (lambda (buffer-name &rest _)
+                          (let ((buffer (generate-new-buffer buffer-name))
+                                (process (start-process "mock-claude" nil
+                                                        "sleep" "30")))
+                            (push process processes)
+                            (cons buffer process))))
+                       ((symbol-function 'claude-code-ide--display-buffer-in-side-window)
+                        (lambda (buffer) (push buffer displayed) nil)))
+               (claude-code-ide--start-session)
+               (claude-code-ide-start)
+               (let* ((sessions (claude-code-ide-mcp--sessions-for-project working-dir))
+                      (names (mapcar #'claude-code-ide-mcp-session-instance-name sessions)))
+                 (should (= 2 (length sessions)))
+                 (should (member nil names))
+                 (should (member "2" names)))))))
+      (dolist (session (claude-code-ide-mcp--active-sessions))
+        (ignore-errors (claude-code-ide--cleanup-session session)))
+      (dolist (process processes)
+        (when (process-live-p process)
+          (delete-process process)))
+      (claude-code-ide-tests--stop-all-sessions)
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-start-rejects-invalid-name ()
+  "`claude-code-ide-start' errors on an unusable name instead of prompting."
+  (claude-code-ide-tests--clear-processes)
+  (unwind-protect
+      (let ((project-dir "/tmp/claude-start-invalid/"))
+        (claude-code-ide-tests--make-session project-dir :instance-name "taken")
+        (cl-letf (((symbol-function 'claude-code-ide--get-working-directory)
+                   (lambda () (expand-file-name project-dir)))
+                  ((symbol-function 'read-string)
+                   (lambda (&rest _)
+                     (error "read-string must not be called by claude-code-ide-start"))))
+          (should-error (claude-code-ide-start "taken") :type 'user-error)
+          (should-error (claude-code-ide-start "7") :type 'user-error)
+          (should-error (claude-code-ide-start "bad[name") :type 'user-error)
+          ;; Nothing got created by the rejected calls
+          (should (= 1 (length (claude-code-ide-mcp--sessions-for-project
+                                (expand-file-name project-dir)))))))
+    (claude-code-ide-tests--clear-processes)))
+
+(ert-deftest claude-code-ide-test-instance-name-problem ()
+  "`claude-code-ide--instance-name-problem' flags the same cases read-instance-name does."
+  (claude-code-ide-tests--clear-processes)
+  (unwind-protect
+      (let ((project-dir "/tmp/claude-name-problem/"))
+        (claude-code-ide-tests--make-session project-dir :instance-name "taken")
+        (should (claude-code-ide--instance-name-problem "7" project-dir))
+        (should (claude-code-ide--instance-name-problem "bad[name" project-dir))
+        (should (claude-code-ide--instance-name-problem "bad]name" project-dir))
+        (should (claude-code-ide--instance-name-problem "bad*name" project-dir))
+        (should (claude-code-ide--instance-name-problem "taken" project-dir))
+        (should-not (claude-code-ide--instance-name-problem "fresh" project-dir))
+        ;; EXCLUDE-SESSION makes its own name free again (used while renaming)
+        (let ((session (car (claude-code-ide-mcp--sessions-for-project project-dir))))
+          (should-not (claude-code-ide--instance-name-problem
+                      "taken" project-dir session))))
+    (claude-code-ide-tests--clear-processes)))
+
 (ert-deftest claude-code-ide-test-check-status ()
   "Test status check command."
   (let ((claude-code-ide-cli-path "echo")
